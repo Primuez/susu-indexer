@@ -475,7 +475,7 @@ export class IndexerDb {
       console.error(
         JSON.stringify({
           level: 'error',
-          message: 'Failed to record indexer run failure',
+          message: 'Exception recording indexer run failure',
           correlationId: params.correlationId,
           error: err instanceof Error ? err.message : String(err),
         }),
