@@ -389,7 +389,29 @@ export class IndexerDb {
     lastProcessedLedger: number;
     startLedger: number;
   }): Promise<void> {
-    const { error } = await this.#client
+    const { data, error } = await this.#client
+      .from('indexer_checkpoints')
+      .update({
+        last_processed_ledger: params.lastProcessedLedger,
+        start_ledger: params.startLedger,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 'default')
+      .lt('last_processed_ledger', params.lastProcessedLedger)
+      .select('id');
+
+    if (error) {
+      throw new Error(`Failed to advance indexer checkpoint: ${error.message}`);
+    }
+
+    if (data && data.length > 0) {
+      return;
+    }
+
+    // When no row was updated, either no checkpoint row exists yet (initial run),
+    // or an existing checkpoint already has a greater or equal last_processed_ledger.
+    // Insert if absent; ignoreDuplicates ensures this is a no-op if a row already exists.
+    const { error: insertError } = await this.#client
       .from('indexer_checkpoints')
       .upsert(
         {
@@ -398,11 +420,27 @@ export class IndexerDb {
           start_ledger: params.startLedger,
           updated_at: new Date().toISOString(),
         },
-        { onConflict: 'id' },
+        { onConflict: 'id', ignoreDuplicates: true },
       );
 
-    if (error) {
-      throw new Error(`Failed to advance indexer checkpoint: ${error.message}`);
+    if (insertError) {
+      throw new Error(`Failed to advance indexer checkpoint: ${insertError.message}`);
+    }
+
+    // In case a concurrent initial run inserted a lower ledger between our update
+    // and upsert, re-run conditional update to guarantee the higher ledger wins.
+    const { error: recheckError } = await this.#client
+      .from('indexer_checkpoints')
+      .update({
+        last_processed_ledger: params.lastProcessedLedger,
+        start_ledger: params.startLedger,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 'default')
+      .lt('last_processed_ledger', params.lastProcessedLedger);
+
+    if (recheckError) {
+      throw new Error(`Failed to advance indexer checkpoint: ${recheckError.message}`);
     }
   }
 
