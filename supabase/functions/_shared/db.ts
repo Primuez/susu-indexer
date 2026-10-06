@@ -47,8 +47,8 @@ export type IndexedEventRow = {
 export class IndexerDb {
   #client: SupabaseClient;
 
-  constructor(supabaseUrl: string, serviceRoleKey: string) {
-    this.#client = createClient(supabaseUrl, serviceRoleKey, {
+  constructor(supabaseUrl: string, serviceRoleKey: string, client?: SupabaseClient) {
+    this.#client = client ?? createClient(supabaseUrl, serviceRoleKey, {
       auth: { persistSession: false, autoRefreshToken: false },
     });
   }
@@ -103,15 +103,43 @@ export class IndexerDb {
    * so without these the indexer would see only the Factory. The set grows with
    * every group deployed, which is fine at this scale and revisit-worthy beyond
    * it — the RPC takes the whole list as a filter on every page.
+   *
+   * PostgREST caps query responses (max-rows default 1000), so this pages through
+   * the table until exhausted rather than truncating at the cap.
    */
-  async listGroupContractIds(): Promise<string[]> {
-    const { data, error } = await this.#client.from('groups').select('contract_id');
-
-    if (error) {
-      throw new Error(`Failed to read indexed group contracts: ${error.message}`);
+  async listGroupContractIds(pageSize = 1000): Promise<string[]> {
+    if (pageSize <= 0) {
+      throw new Error(`pageSize must be positive, got ${pageSize}`);
     }
 
-    return (data ?? []).map((row) => String(row.contract_id));
+    const contractIds: string[] = [];
+    let from = 0;
+
+    while (true) {
+      const selectQuery = this.#client.from('groups').select('contract_id');
+      const orderedQuery = typeof (selectQuery as { order?: unknown }).order === 'function'
+        ? (selectQuery as { order: (col: string) => typeof selectQuery }).order('contract_id')
+        : selectQuery;
+
+      const { data, error } = await orderedQuery.range(from, from + pageSize - 1);
+
+      if (error) {
+        throw new Error(`Failed to read indexed group contracts: ${error.message}`);
+      }
+
+      const rows = data ?? [];
+      for (const row of rows) {
+        contractIds.push(String(row.contract_id));
+      }
+
+      if (rows.length < pageSize) {
+        break;
+      }
+
+      from += pageSize;
+    }
+
+    return contractIds;
   }
 
   /**
