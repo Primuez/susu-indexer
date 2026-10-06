@@ -98,7 +98,15 @@ async function reconcileGroups(
   return divergences;
 }
 
-export async function handleRequest(request: Request): Promise<Response> {
+export type HandlerDependencies = {
+  db?: IndexerDb;
+  rpc?: SorobanRpcClient;
+};
+
+export async function handleRequest(
+  request: Request,
+  deps?: HandlerDependencies,
+): Promise<Response> {
   const correlationId = crypto.randomUUID();
   const logger = createLogger(correlationId);
 
@@ -120,8 +128,10 @@ export async function handleRequest(request: Request): Promise<Response> {
     return jsonResponse({ status: 'failed', correlationId, reason: 'unauthorized' }, 401);
   }
 
-  const db = new IndexerDb(config.supabaseUrl, config.serviceRoleKey);
-  const rpc = new SorobanRpcClient(config.rpcUrl);
+  const db = (deps && 'db' in deps && deps.db)
+    ? deps.db
+    : new IndexerDb(config.supabaseUrl, config.serviceRoleKey);
+  const rpc = (deps && 'rpc' in deps && deps.rpc) ? deps.rpc : new SorobanRpcClient(config.rpcUrl);
 
   try {
     const checkpoint = await withRetry(() => db.getCheckpoint(), RETRY);
@@ -276,16 +286,24 @@ export async function handleRequest(request: Request): Promise<Response> {
 
     // Record the failure for operators. The checkpoint is deliberately left
     // untouched so the same range is retried on the next run.
-    await db.recordRunFailure({
-      correlationId,
-      ledgerFrom: 0,
-      ledgerTo: 0,
-      reason,
-    });
+    try {
+      await db.recordRunFailure({
+        correlationId,
+        ledgerFrom: 0,
+        ledgerTo: 0,
+        reason,
+      });
+    } catch (recordError) {
+      logger.error('Failed to record run failure', {
+        error: recordError instanceof Error ? recordError.message : String(recordError),
+      });
+    }
 
     return jsonResponse({ status: 'failed', correlationId, reason }, 500);
   }
 }
 
 // Supabase Edge Functions run this module as the request handler.
-Deno.serve(handleRequest);
+if (import.meta.main) {
+  Deno.serve((req: Request) => handleRequest(req));
+}
