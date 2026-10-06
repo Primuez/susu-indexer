@@ -47,10 +47,16 @@ export type IndexedEventRow = {
 export class IndexerDb {
   #client: SupabaseClient;
 
+  /**
+   * An explicit client may be injected for tests, so the orchestration can be
+   * exercised against a stub instead of a live database. Production callers
+   * omit it and get the service-role client as before.
+   */
   constructor(supabaseUrl: string, serviceRoleKey: string, client?: SupabaseClient) {
-    this.#client = client ?? createClient(supabaseUrl, serviceRoleKey, {
-      auth: { persistSession: false, autoRefreshToken: false },
-    });
+    this.#client = client ??
+      createClient(supabaseUrl, serviceRoleKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
   }
 
   /**
@@ -101,17 +107,41 @@ export class IndexerDb {
    *
    * This is the watch list: a group's events are emitted by its own contract,
    * so without these the indexer would see only the Factory. The set grows with
-   * every group deployed, which is fine at this scale and revisit-worthy beyond
-   * it — the RPC takes the whole list as a filter on every page.
+   * every group deployed. Pages through groups in batches using .range() so lists
+   * larger than PostgREST's max-rows cap (typically 1000) are not truncated.
    */
-  async listGroupContractIds(): Promise<string[]> {
-    const { data, error } = await this.#client.from('groups').select('contract_id');
+  async listGroupContractIds(pageSize = 1000): Promise<string[]> {
+    const contractIds: string[] = [];
+    let from = 0;
 
-    if (error) {
-      throw new Error(`Failed to read indexed group contracts: ${error.message}`);
+    while (true) {
+      const to = from + pageSize - 1;
+      const { data, error } = await this.#client
+        .from('groups')
+        .select('contract_id')
+        .order('contract_id', { ascending: true })
+        .range(from, to);
+
+      if (error) {
+        throw new Error(`Failed to read indexed group contracts: ${error.message}`);
+      }
+
+      if (!data || data.length === 0) {
+        break;
+      }
+
+      for (const row of data) {
+        contractIds.push(String(row.contract_id));
+      }
+
+      if (data.length < pageSize) {
+        break;
+      }
+
+      from += pageSize;
     }
 
-    return (data ?? []).map((row) => String(row.contract_id));
+    return contractIds;
   }
 
   /**
@@ -359,7 +389,29 @@ export class IndexerDb {
     lastProcessedLedger: number;
     startLedger: number;
   }): Promise<void> {
-    const { error } = await this.#client
+    const { data, error } = await this.#client
+      .from('indexer_checkpoints')
+      .update({
+        last_processed_ledger: params.lastProcessedLedger,
+        start_ledger: params.startLedger,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 'default')
+      .lt('last_processed_ledger', params.lastProcessedLedger)
+      .select('id');
+
+    if (error) {
+      throw new Error(`Failed to advance indexer checkpoint: ${error.message}`);
+    }
+
+    if (data && data.length > 0) {
+      return;
+    }
+
+    // When no row was updated, either no checkpoint row exists yet (initial run),
+    // or an existing checkpoint already has a greater or equal last_processed_ledger.
+    // Insert if absent; ignoreDuplicates ensures this is a no-op if a row already exists.
+    const { error: insertError } = await this.#client
       .from('indexer_checkpoints')
       .upsert(
         {
@@ -368,11 +420,27 @@ export class IndexerDb {
           start_ledger: params.startLedger,
           updated_at: new Date().toISOString(),
         },
-        { onConflict: 'id' },
+        { onConflict: 'id', ignoreDuplicates: true },
       );
 
-    if (error) {
-      throw new Error(`Failed to advance indexer checkpoint: ${error.message}`);
+    if (insertError) {
+      throw new Error(`Failed to advance indexer checkpoint: ${insertError.message}`);
+    }
+
+    // In case a concurrent initial run inserted a lower ledger between our update
+    // and upsert, re-run conditional update to guarantee the higher ledger wins.
+    const { error: recheckError } = await this.#client
+      .from('indexer_checkpoints')
+      .update({
+        last_processed_ledger: params.lastProcessedLedger,
+        start_ledger: params.startLedger,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', 'default')
+      .lt('last_processed_ledger', params.lastProcessedLedger);
+
+    if (recheckError) {
+      throw new Error(`Failed to advance indexer checkpoint: ${recheckError.message}`);
     }
   }
 

@@ -22,7 +22,7 @@
 
 import { authorizeInvocation } from '../_shared/auth.ts';
 import { canAdvanceCheckpoint, computeLedgerRange, ledgerLag } from '../_shared/checkpoint.ts';
-import { loadConfig } from '../_shared/config.ts';
+import { type IndexerConfig, loadConfig } from '../_shared/config.ts';
 import { type IndexedEventRow, IndexerDb } from '../_shared/db.ts';
 import { decodeChainEvents } from '../_shared/decode.ts';
 import { discoverGroups } from '../_shared/discovery.ts';
@@ -30,12 +30,21 @@ import { buildEventIdentity, compareEventOrder, dedupeByIdentity } from '../_sha
 import { planIngest } from '../_shared/ingest.ts';
 import { createLogger } from '../_shared/logger.ts';
 import { withRetry } from '../_shared/retry.ts';
-import { fetchRangeEvents } from '../_shared/scan.ts';
+import { type EventSource, fetchRangeEvents } from '../_shared/scan.ts';
 import { compareGroupState, deriveGroupState, NO_FACTS } from '../_shared/state.ts';
 import { type RpcEvent, SorobanRpcClient } from '../_shared/stellar.ts';
 
 /** Bounded retry policy for transient RPC and database failures. */
 const RETRY = { attempts: 4, baseDelayMs: 250, maxDelayMs: 4_000 } as const;
+
+/**
+ * The slice of the RPC client the request handler needs: what the scan needs,
+ * plus the chain head. Narrow on purpose, so tests can script it without
+ * standing up a network server.
+ */
+export type RpcSource = EventSource & {
+  getLatestLedger(): Promise<number>;
+};
 
 type RunSummary = {
   status: 'ok' | 'skipped' | 'failed';
@@ -98,19 +107,16 @@ async function reconcileGroups(
   return divergences;
 }
 
-export type HandlerDependencies = {
-  db?: IndexerDb;
-  rpc?: SorobanRpcClient;
-};
-
 export async function handleRequest(
   request: Request,
-  deps?: HandlerDependencies,
+  deps: { db?: IndexerDb; rpc?: RpcSource } = {},
 ): Promise<Response> {
   const correlationId = crypto.randomUUID();
   const logger = createLogger(correlationId);
 
-  const configResult = loadConfig();
+  const configResult = (deps && 'config' in deps && deps.config)
+    ? { ok: true as const, config: deps.config }
+    : loadConfig();
   if (!configResult.ok) {
     // Report which variables are problematic — never their values.
     const reason = `invalid configuration (missing: ${
@@ -128,10 +134,8 @@ export async function handleRequest(
     return jsonResponse({ status: 'failed', correlationId, reason: 'unauthorized' }, 401);
   }
 
-  const db = (deps && 'db' in deps && deps.db)
-    ? deps.db
-    : new IndexerDb(config.supabaseUrl, config.serviceRoleKey);
-  const rpc = (deps && 'rpc' in deps && deps.rpc) ? deps.rpc : new SorobanRpcClient(config.rpcUrl);
+  const db = deps.db ?? new IndexerDb(config.supabaseUrl, config.serviceRoleKey);
+  const rpc = deps.rpc ?? new SorobanRpcClient(config.rpcUrl);
 
   try {
     const checkpoint = await withRetry(() => db.getCheckpoint(), RETRY);
@@ -207,8 +211,11 @@ export async function handleRequest(
 
     // Both passes are deduplicated by chain identity, so the overlap that a
     // retried range can produce collapses to one write per event.
+    // Events from failed contract calls are never indexed (stellar.ts:35-42).
     const raw = dedupeByIdentity(
-      [...firstPass, ...secondPass].sort(compareEventOrder),
+      [...firstPass, ...secondPass]
+        .filter((event) => event.successful === true)
+        .sort(compareEventOrder),
       buildEventIdentity,
     );
     const secondDecoded = decodeChainEvents(secondPass);
@@ -294,8 +301,8 @@ export async function handleRequest(
         reason,
       });
     } catch (recordError) {
-      logger.error('Failed to record run failure', {
-        error: recordError instanceof Error ? recordError.message : String(recordError),
+      logger.error('Failed to record run failure in database', {
+        reason: recordError instanceof Error ? recordError.message : String(recordError),
       });
     }
 
@@ -303,7 +310,9 @@ export async function handleRequest(
   }
 }
 
-// Supabase Edge Functions run this module as the request handler.
+// Supabase Edge Functions run this module as the request handler. Guarded so
+// importing the module (e.g. in tests) does not start a server: the platform
+// executes the entrypoint file as the main module, where this is true.
 if (import.meta.main) {
-  Deno.serve((req: Request) => handleRequest(req));
+  Deno.serve((request) => handleRequest(request));
 }
