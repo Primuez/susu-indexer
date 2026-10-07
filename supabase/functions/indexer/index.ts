@@ -109,7 +109,7 @@ async function reconcileGroups(
 
 export async function handleRequest(
   request: Request,
-  deps: { db?: IndexerDb; rpc?: RpcSource } = {},
+  deps: { db?: IndexerDb; rpc?: RpcSource; config?: IndexerConfig } = {},
 ): Promise<Response> {
   const correlationId = crypto.randomUUID();
   const logger = createLogger(correlationId);
